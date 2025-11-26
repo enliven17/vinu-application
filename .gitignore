@@ -1,0 +1,30 @@
+# Terraform
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+terraform/vinu-task-key-generated.pem
+*.pem
+*.zip
+terraform.exe
+
+# Node.js
+node_modules/
+dist/
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*

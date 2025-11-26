@@ -1,0 +1,155 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_FRONTEND: vinu-task2-frontend
+  ECR_REPOSITORY_BACKEND: vinu-task2-backend
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push frontend image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG ./frontend
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:latest
+
+      - name: Build, tag, and push backend image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG ./backend
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:latest
+
+      - name: Get EC2 instance IP
+        id: get-ec2-ip
+        run: |
+          if [ -n "${{ secrets.EC2_HOST }}" ]; then
+            INSTANCE_IP="${{ secrets.EC2_HOST }}"
+          else
+            INSTANCE_IP=$(aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=VinuTask2Server" "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text \
+              --region ${{ env.AWS_REGION }})
+          fi
+          
+          if [ -z "$INSTANCE_IP" ] || [ "$INSTANCE_IP" == "None" ]; then
+            echo "Error: Could not determine EC2 instance IP"
+            exit 1
+          fi
+          
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+          echo "EC2 Instance IP: $INSTANCE_IP"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+          ssh-keyscan -H ${{ steps.get-ec2-ip.outputs.instance_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Get ECR password
+        id: ecr-password
+        run: |
+          ECR_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          echo "::add-mask::$ECR_PASSWORD"
+          echo "password=$ECR_PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Deploy to EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_PASSWORD: ${{ steps.ecr-password.outputs.password }}
+        run: |
+          EC2_HOST="${{ steps.get-ec2-ip.outputs.instance_ip }}"
+          SSH_CMD="ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@$EC2_HOST"
+          SCP_CMD="scp -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no"
+          
+          # 1. Setup EC2 - Install AWS CLI and Docker if needed
+          $SSH_CMD << 'SETUP_SCRIPT'
+          set -e
+          # Install AWS CLI if not present
+          if ! command -v aws &> /dev/null; then
+            echo "Installing AWS CLI..."
+            sudo apt-get update
+            sudo apt-get install -y awscli
+          fi
+          
+          # Ensure docker is running
+          sudo systemctl start docker || true
+          sudo usermod -aG docker ubuntu || true
+          
+          # Create app directory
+          sudo mkdir -p /opt/app
+          sudo chown ubuntu:ubuntu /opt/app
+          SETUP_SCRIPT
+          
+          # 2. Copy docker-compose file
+          $SCP_CMD docker-compose.prod.yml ubuntu@$EC2_HOST:/opt/app/docker-compose.yml
+          
+          # 3. Deploy application
+          $SSH_CMD << DEPLOY_SCRIPT
+          set -e
+          cd /opt/app
+          
+          # Create .env file
+          cat > .env << EOF
+          AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}
+          AWS_REGION=${AWS_REGION}
+          EOF
+          
+          # Login to ECR
+          echo "${ECR_PASSWORD}" | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+          
+          # Pull and deploy
+          export AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}
+          export AWS_REGION=${AWS_REGION}
+          
+          docker compose pull || docker-compose pull
+          docker compose down || docker-compose down || true
+          docker compose up -d || docker-compose up -d
+          
+          # Wait and verify
+          sleep 15
+          docker compose ps || docker-compose ps
+          
+          echo "Deployment completed!"
+          DEPLOY_SCRIPT
+          
+          echo ""
+          echo "=========================================="
+          echo "✓ Deployment completed!"
+          echo "Application URL: http://$EC2_HOST"
+          echo "=========================================="
